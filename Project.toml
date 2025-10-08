@@ -1,0 +1,13 @@
+name = "BangBangSimulation"
+uuid = "adb86412-1c0f-42f5-abb5-12acd1b48164"
+authors = ["Leonardo Bacciottini"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.11.7"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
