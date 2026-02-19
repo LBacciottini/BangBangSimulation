@@ -8,7 +8,7 @@ import ConcurrentSim
 using ConcurrentSim: Simulation, @yield, timeout, @process, now, Process
 import ResumableFunctions
 using ResumableFunctions: @resumable
-import QuantumSavory: Tag
+import QuantumSavory: Tag, isolderthan
 
 include("enhanced_swapping.jl")
 
@@ -51,8 +51,8 @@ function get_entangler(sim, net, nodeA, nodeB, rate , capacity, slack)
     return EntanglerProt(sim, net, nodeA, nodeB; attempt_time=attempt_time, success_prob=attempt_probability, rounds=1, tag=PrivateEntanglementCounterpart, margin=1, retry_lock_time=nothing, attempts=max_attempts)
 end
 
-function get_swapper(sim, net, node)
-    return EnhancedSwapperProt(sim, net, node; nodeL= <(node), nodeH= >(node), retry_lock_time=nothing, policy="OQF")
+function get_swapper(sim, net, node; agelimit=nothing)
+    return EnhancedSwapperProt(sim, net, node; nodeL= <(node), nodeH= >(node), retry_lock_time=nothing, policy="OQF", agelimit=agelimit)
 end
 
 
@@ -325,6 +325,7 @@ end
 function dump_log(prot::SchedulerProt)
     fn = prot.out_filename
     fn === nothing && return
+    isempty(prot._log) && return
     first_write = !isfile(fn)
     if first_write
         header = NamedTuple{Tuple(collect(keys(prot._log[1])))}(Tuple(Vector{Any}() for _ in keys(prot._log[1])))  # 0-row, named columns
@@ -440,7 +441,7 @@ end
 end
 
 
-function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linklength::AbstractFloat=0.0, slack=0.4, coherencetime::Union{AbstractFloat, Nothing}=nothing, outfolder::String="./out/", outfile::Union{String, Nothing}=nothing, usetempfile::Bool=false)
+function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linklength::AbstractFloat=0.0, slack=0.4, coherencetime::Union{AbstractFloat, Nothing}=nothing, cutofftime::Union{Float64, Nothing}=nothing, outfolder::String="./out/", outfile::Union{String, Nothing}=nothing, usetempfile::Bool=false)
     net = repeater_chain(nrepeaters, nslots; linklength=linklength, coherencetime=coherencetime)
     sim = get_time_tracker(net)
 
@@ -450,9 +451,18 @@ function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linkle
         @process tracker()
     end
 
+    # Setup cutoff protocol at each node if cutofftime is specified
+    if cutofftime !== nothing
+        for node in 1:(nrepeaters+2)
+            cutoff = CutoffProt(sim, net, node; retention_time=cutofftime, announce=true)
+            @process cutoff()
+        end
+    end
+
     # Setup the entanglement swapping protocols at each repeater
+    swapper_agelimit = cutofftime !== nothing ? cutofftime * 0.8 : nothing
     for node in 2:(nrepeaters+1)
-        swapper = get_swapper(sim, net, node)
+        swapper = get_swapper(sim, net, node; agelimit=swapper_agelimit)
         @process swapper()
     end
 
