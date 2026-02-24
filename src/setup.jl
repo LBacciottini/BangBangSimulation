@@ -16,7 +16,8 @@ function repeater_chain(nrepeaters::Int, nslots::Int; linklength::AbstractFloat=
 
     speedOfLightFiber = 2e8 # km/s
     delay = linklength / speedOfLightFiber
-    delay_us = delay * 1e6 # in microseconds
+    # delay_us = delay * 1e6 # in microseconds
+    delay_us = 0.0
 
     graph = grid([nrepeaters + 2])
     if coherencetime === nothing
@@ -51,8 +52,8 @@ function get_entangler(sim, net, nodeA, nodeB, rate , capacity, slack)
     return EntanglerProt(sim, net, nodeA, nodeB; attempt_time=attempt_time, success_prob=attempt_probability, rounds=1, tag=PrivateEntanglementCounterpart, margin=1, retry_lock_time=nothing, attempts=max_attempts)
 end
 
-function get_swapper(sim, net, node; agelimit=nothing)
-    return EnhancedSwapperProt(sim, net, node; nodeL= <(node), nodeH= >(node), retry_lock_time=nothing, policy="OQF", agelimit=agelimit)
+function get_swapper(sim, net, node; agelimit=nothing, policy::String="OQF")
+    return EnhancedSwapperProt(sim, net, node; nodeL= <(node), nodeH= >(node), retry_lock_time=nothing, policy=policy, agelimit=agelimit)
 end
 
 
@@ -86,7 +87,7 @@ CustomEntanglementTracker(net::RegisterNet, node::Int) = CustomEntanglementTrack
                     (src, (_, pastremotenode, pastremoteslotid, _, localslotid)) = msg
                 end
 
-                @info "CustomEntanglementTracker (entry found) @$(prot.node): Received from $(msg.src).$(msg.tag[3]) | message=`$(msg.tag)` | time=$(now(prot.sim))"
+                @debug "CustomEntanglementTracker (entry found) @$(prot.node): Received from $(msg.src).$(msg.tag[3]) | message=`$(msg.tag)` | time=$(now(prot.sim))"
                 workwasdone = true
                 localslot = nodereg[localslotid]
 
@@ -134,7 +135,7 @@ CustomEntanglementTracker(net::RegisterNet, node::Int) = CustomEntanglementTrack
                     if !isnothing(updategate) # EntanglementUpdate
                         # Forward the update tag to the swapped node and store a new history tag so that we can forward the next update tag to the new node
                         tag!(localslot, EntanglementHistory, newremotenode, newremoteslotid, whoweswappedwith_node, whoweswappedwith_slotidx, swappedlocal_slotidx)
-                        @info "CustomEntanglementTracker (entry not found) @$(prot.node): history=`$(history)` | message=`$msg` | Sending to $(whoweswappedwith_node).$(whoweswappedwith_slotidx)"
+                        @debug "CustomEntanglementTracker (entry not found) @$(prot.node): history=`$(history)` | message=`$msg` | Sending to $(whoweswappedwith_node).$(whoweswappedwith_slotidx)"
                         msghist = Tag(updatetagsymbol, pastremotenode, pastremoteslotid, whoweswappedwith_slotidx, newremotenode, newremoteslotid, correction)
                         put!(channel(prot.net, prot.node=>whoweswappedwith_node; permit_forward=true), msghist)
 
@@ -235,10 +236,10 @@ permits_virtual_edge(::CustomEntanglementConsumer) = true
         query1 = query(regA, prot.tag, prot.nodeB, ❓; locked=false, assigned=true) # TODO Need a `querydelete!` dispatch on `Register` rather than using `query` here followed by `untag!` below
         if isnothing(query1)
             if isnothing(prot.period)
-                @info "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on first node found no entanglement. Waiting on tag updates in $(QuantumSavory.compactstr(regA))."
+                @debug "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on first node found no entanglement. Waiting on tag updates in $(QuantumSavory.compactstr(regA))."
                 @yield onchange(regA, Tag)
             else
-                @info "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on first node found no entanglement. Waiting a fixed amount of time."
+                @debug "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on first node found no entanglement. Waiting a fixed amount of time."
                 @yield timeout(prot.sim, prot.period::Float64)
             end
             continue
@@ -246,10 +247,10 @@ permits_virtual_edge(::CustomEntanglementConsumer) = true
             query2 = query(regB, prot.tag, prot.nodeA, query1.slot.idx; locked=false, assigned=true)
             if isnothing(query2) # in case EntanglementUpdate hasn't reached the second node yet, but the first node has the EntanglementCounterpart
                 if isnothing(prot.period)
-                    @info "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on second node found no entanglement (yet...). Waiting on tag updates in $(QuantumSavory.compactstr(regB))."
+                    @debug "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on second node found no entanglement (yet...). Waiting on tag updates in $(QuantumSavory.compactstr(regB))."
                     @yield onchange(regB, Tag)
                 else
-                    @info "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on second node found no entanglement (yet...). Waiting a fixed amount of time."
+                    @debug "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): query on second node found no entanglement (yet...). Waiting a fixed amount of time."
                     @yield timeout(prot.sim, prot.period::Float64)
                 end
                 continue
@@ -260,25 +261,28 @@ permits_virtual_edge(::CustomEntanglementConsumer) = true
         q2 = query2.slot
         @yield lock(q1) & lock(q2)
 
-        @info "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): queries successful, consuming entanglement between .$(q1.idx) and .$(q2.idx)"
+        @debug "$(QuantumSavory.timestr(prot.sim)) CustomEntanglementConsumer($(QuantumSavory.compactstr(regA)), $(QuantumSavory.compactstr(regB))): queries successful, consuming entanglement between .$(q1.idx) and .$(q2.idx)"
         untag!(q1, query1.id)
         untag!(q2, query2.id)
         # TODO do we need to add EntanglementHistory or EntanglementDelete and should that be a different EntanglementHistory since the current one is specifically for Swapper
         # TODO currently when calculating the observable we assume that EntanglerProt.pairstate is always (|00⟩ + |11⟩)/√2, make it more general for other states
 
         if observable((q1, q2), Z⊗Z) === nothing || observable((q1, q2), X⊗X) === nothing
-            @error "CustomEntanglementConsumer: One of the observables is not defined for the qubit pair. This should not happen. Investigating."
-            @error "RegRef pair A: $(QuantumSavory.compactstr(q1)), $(query1.tag[2]).$(query1.tag[3]), RegRef B: $(QuantumSavory.compactstr(q2)), $(query2.tag[2]).$(query2.tag[3])"
-            @error "Node $(prot.nodeA), slot .$(q1.idx), other node $(prot.nodeB), slot .$(q2.idx). Quantum states (should match): q1=$(regA.staterefs[q1.idx]), q2=$(regB.staterefs[q2.idx])"
+            @warn "CustomEntanglementConsumer: One of the observables is not defined for the qubit pair. This should not happen. Investigating."
+            @warn "RegRef pair A: $(QuantumSavory.compactstr(q1)), $(query1.tag[2]).$(query1.tag[3]), RegRef B: $(QuantumSavory.compactstr(q2)), $(query2.tag[2]).$(query2.tag[3])"
+            @warn "Node $(prot.nodeA), slot .$(q1.idx), other node $(prot.nodeB), slot .$(q2.idx). Quantum states (should match): q1=$(regA.staterefs[q1.idx]), q2=$(regB.staterefs[q2.idx])"
+            @warn "This is due to a known bug"
+
+        else
+            ob1 = real(observable((q1, q2), Z⊗Z))
+            ob2 = real(observable((q1, q2), X⊗X))
+            push!(prot._log, (now(prot.sim), ob1, ob2))
         end
 
-        ob1 = real(observable((q1, q2), Z⊗Z))
-        ob2 = real(observable((q1, q2), X⊗X))
-
         traceout!(regA[q1.idx], regB[q2.idx])
-        push!(prot._log, (now(prot.sim), ob1, ob2))
         unlock(q1)
         unlock(q2)
+
         if !isnothing(prot.period)
             @yield timeout(prot.sim, prot.period)
         end
@@ -441,7 +445,7 @@ end
 end
 
 
-function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linklength::AbstractFloat=0.0, slack=0.4, coherencetime::Union{AbstractFloat, Nothing}=nothing, cutofftime::Union{Float64, Nothing}=nothing, outfolder::String="./out/", outfile::Union{String, Nothing}=nothing, usetempfile::Bool=false)
+function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linklength::AbstractFloat=0.0, slack=0.4, coherencetime::Union{AbstractFloat, Nothing}=nothing, cutofftime::Union{Float64, Nothing}=nothing, policy::String="OQF", outfolder::String="./out/", outfile::Union{String, Nothing}=nothing, usetempfile::Bool=false)
     net = repeater_chain(nrepeaters, nslots; linklength=linklength, coherencetime=coherencetime)
     sim = get_time_tracker(net)
 
@@ -462,7 +466,7 @@ function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linkle
     # Setup the entanglement swapping protocols at each repeater
     swapper_agelimit = cutofftime !== nothing ? cutofftime * 0.8 : nothing
     for node in 2:(nrepeaters+1)
-        swapper = get_swapper(sim, net, node; agelimit=swapper_agelimit)
+        swapper = get_swapper(sim, net, node; agelimit=swapper_agelimit, policy=policy)
         @process swapper()
     end
 
