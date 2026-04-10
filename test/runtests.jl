@@ -150,8 +150,9 @@ const OUTFOLDER = mktempdir()
         @testset "default_config consistency" begin
             cfg = default_config()
             @test cfg.coherencetime == 2.0
-            @test cfg.scenarios[4].cutofftime ≈ cfg.coherencetime / 50.0
-            @test length(cfg.scenarios) == 5
+            @test cfg.scenarios[4].policy == "YQF"
+            @test cfg.scenarios[4].cutofftime === nothing
+            @test length(cfg.scenarios) == 7
         end
     end
 

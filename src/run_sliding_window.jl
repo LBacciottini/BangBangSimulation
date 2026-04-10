@@ -14,7 +14,7 @@ end
 
 function main()
     cfg = default_config()
-    sim_time = parse(Float64, get(ENV, "SIM_TIME_S", "200.0"))
+    sim_time = parse(Float64, get(ENV, "SIM_TIME_S", "100.0"))
     window_size = parse(Float64, get(ENV, "WINDOW_SIZE_S", "10.0"))
     window_step = parse(Float64, get(ENV, "WINDOW_STEP_S", "1.0"))
     seed = parse(Int, get(ENV, "SEED", "42"))

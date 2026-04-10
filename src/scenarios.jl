@@ -1,6 +1,17 @@
 using Statistics
 using Random
 
+function binary_entropy(x::Float64)
+    (x <= 0.0 || x >= 1.0) && return 0.0
+    return -x * log2(x) - (1.0 - x) * log2(1.0 - x)
+end
+
+function bb84_skr(fidelity::Float64, throughput::Float64)
+    qber = 2.0 * (1.0 - fidelity) / 3.0
+    r = 1.0 - 2.0 * binary_entropy(qber)
+    return throughput * max(0.0, r)
+end
+
 struct Scenario
     name::String
     nslots::Int
@@ -36,21 +47,54 @@ function mean_ci(x::Vector{Float64})
     return (m, m - z * se, m + z * se)
 end
 
-function safe_analyze_consumer_data(df::DataFrame)
-    steady_state = filter(row -> row.time > 100.0, df)
+function safe_analyze_consumer_data(df::DataFrame; steady_state_start::Float64=100.0)
+    steady_state = filter(row -> row.time > steady_state_start, df)
     if nrow(steady_state) < 2
         return (NaN, NaN)
     end
-    fidelity_raw, throughput = analyze_consumer_data(df)
+    fidelity_raw, throughput = analyze_consumer_data(df; steady_state_start)
     fidelity = (3 * fidelity_raw + 1) / 4
     return (fidelity, throughput)
 end
 
+"""
+    optimal_slack(linklength_km) -> Float64
+
+Interpolate the optimal Bang-Bang slack for a given link length (km).
+Based on numerical optimization results.
+"""
+function optimal_slack(linklength_km::Float64)
+    # (length_km, optimal_slack) from optimization
+    table = [
+        ( 5.0, 0.0030),
+        (10.0, 0.0030),
+        (15.0, 0.2438),
+        (20.0, 0.3745),
+        (25.0, 0.4781),
+        (30.0, 0.5797),
+        (35.0, 0.6989),
+        (40.0, 0.8531),
+    ]
+    # Clamp to table range
+    linklength_km <= table[1][1] && return table[1][2]
+    linklength_km >= table[end][1] && return table[end][2]
+    # Linear interpolation
+    for i in 1:length(table)-1
+        l1, s1 = table[i]
+        l2, s2 = table[i+1]
+        if l1 <= linklength_km <= l2
+            t = (linklength_km - l1) / (l2 - l1)
+            return s1 + t * (s2 - s1)
+        end
+    end
+    return table[end][2]
+end
+
 function default_config()
     nrepeaters = 3
-    sim_time = parse(Float64, get(ENV, "SIM_TIME_S", "200.0"))
-    nslots_infinite = parse(Int, get(ENV, "NSLOTS_INF", "5000"))
-    nslots_finite = 10
+    sim_time = parse(Float64, get(ENV, "SIM_TIME_S", "100.0"))
+    nslots_infinite = parse(Int, get(ENV, "NSLOTS_INF", "500"))
+    nslots_finite = 6
     linklength_km = parse(Float64, get(ENV, "LINKLENGTH_KM", "20.0"))
     coherencetime = parse(Float64, get(ENV, "COHERENCE_TIME_S", "2.0"))
     excitation_time_s = parse(Float64, get(ENV, "EXCITATION_TIME_S", "17e-6"))
@@ -63,10 +107,13 @@ function default_config()
 
     scenarios = [
         Scenario("S1_infinite_no_bangbang", nslots_infinite, 0.0, "OQF", nothing),
-        Scenario("S2_finite10_no_bangbang", nslots_finite, 0.0, "OQF", nothing),
-        Scenario("S3_infinite_yqf_no_bangbang", nslots_infinite, 0.0, "YQF", nothing),
-        Scenario("S4_infinite_cutoff_no_bangbang", nslots_infinite, 0.0, "OQF", coherencetime / 50.0),
-        Scenario("S5_infinite_bangbang_slack30", nslots_infinite, 0.30, "OQF", nothing),
+        Scenario("S2_finite6_no_bangbang", nslots_finite, 0.0, "OQF", nothing),
+        Scenario("S3_finite50_no_bangbang", 50, 0.0, "OQF", nothing),
+        Scenario("S4_infinite_yqf_no_bangbang", nslots_infinite, 0.0, "YQF", nothing),
+        Scenario("S7_infinite_bangbang_optslack", nslots_infinite, NaN, "YQF", nothing),
+        Scenario("S8_infinite_pyqf_no_bangbang", nslots_infinite, 0.0, "PYQF", nothing),
+        Scenario("S9_infinite_yqf_cutoff02", nslots_infinite, 0.0, "YQF", 0.2),
+        Scenario("S10_infinite_bangbang_cutoff02", nslots_infinite, NaN, "YQF", 0.2),
     ]
 
     return (;
@@ -186,4 +233,30 @@ function run_one_sliding(
     df = sliding_window_analysis(consumer._log; window_size=window_size, step=window_step)
     df[!, :scenario] .= scenario.name
     return df
+end
+
+function run_one_steady(
+    seed::Int, scenario::Scenario;
+    nrepeaters::Int, linkcapacity::Float64, linklength_km::Float64,
+    coherencetime::Float64, sim_time::Float64,
+    steady_state_start::Float64=50.0,
+)
+    Random.seed!(seed)
+    tmpdir = mktempdir()
+    sim, _, consumer, _ = setup(
+        nrepeaters, scenario.nslots, linkcapacity;
+        linklength=linklength_km, slack=scenario.slack,
+        coherencetime=coherencetime, cutofftime=scenario.cutofftime,
+        policy=scenario.policy, outfolder=tmpdir, usetempfile=true,
+    )
+    ConcurrentSim.run(sim, sim_time)
+    log = consumer._log
+    steady = filter(e -> e.t > steady_state_start, log)
+    if length(steady) < 2
+        return (seed=seed, fidelity=NaN, throughput=NaN)
+    end
+    fidelity_raw = mean(e.obs1 for e in steady)
+    fidelity = (3 * fidelity_raw + 1) / 4
+    throughput = length(steady) / (maximum(e.t for e in steady) - minimum(e.t for e in steady))
+    return (seed=seed, fidelity=fidelity, throughput=throughput)
 end

@@ -15,8 +15,20 @@ function enhancedfindswapablequbits(net, node, pred_low, pred_high, choose_low, 
     ]
     (isempty(low_queryresults) || isempty(high_queryresults)) && return nothing
 
+    # We use reg.accesstimes[slot.idx] as the local initialization time for OQF/YQF.
+    # Currently this is correct because apply!() in the tracker's Pauli correction path
+    # (setup.jl, CustomEntanglementTracker) is called WITHOUT an explicit `time` argument,
+    # so apply!() computes max_time = the slot's own accesstime and uptotime!() writes
+    # that same value back — no change.
+    #
+    # WARNING: if Pauli corrections are ever changed to pass an explicit `time` argument
+    # to apply!() (e.g. to model non-instantaneous classical communication), accesstimes
+    # will be updated to a time later than the original initialization. In that case,
+    # a dedicated SlotInitTime tag (set once at pair creation, never modified) should be
+    # introduced to preserve a clean notion of local qubit age. See git history for a
+    # prior implementation of this approach.
     created_at(slot::RegRef) = slot.reg.accesstimes[slot.idx]
-    
+
     if policy == "RAND"
         choosefunc = chooseslots isa Vector{Int} ? in(chooseslots) : chooseslots
         low_queryresults = [qr for qr in low_queryresults if choosefunc(qr.slot.idx)]
@@ -28,15 +40,22 @@ function enhancedfindswapablequbits(net, node, pred_low, pred_high, choose_low, 
         return (low_queryresults[il], high_queryresults[ih])
 
     elseif policy == "OQF"
-        # need to go look into the access times of all eligible slots and pick the oldest (or youngest) ones
-        # use the helper function created_at(slot::RegRef). Pick the min (or max) created_at value among the eligible slots
-        # ignore chooseslots, choose_low, choose_high in this case
+        # Pick the qubit that was locally initialized the longest ago (oldest first).
         il = argmin([created_at(qr.slot) for qr in low_queryresults], dims=1)[1]
         ih = argmin([created_at(qr.slot) for qr in high_queryresults], dims=1)[1]
         return (low_queryresults[il], high_queryresults[ih])
     elseif policy == "YQF"
+        # Pick the qubit that was locally initialized most recently (youngest first).
         il = argmax([created_at(qr.slot) for qr in low_queryresults], dims=1)[1]
         ih = argmax([created_at(qr.slot) for qr in high_queryresults], dims=1)[1]
+        return (low_queryresults[il], high_queryresults[ih])
+    elseif policy == "PYQF"
+        # Priority-YQF: pick the qubit entangled with the furthest node,
+        # break ties by youngest qubit first.
+        # Low side: furthest = smallest remote_node (tag[2]), then youngest (max created_at)
+        il = argmin([(qr.tag[2], -created_at(qr.slot)) for qr in low_queryresults])
+        # High side: furthest = largest remote_node (tag[2]), then youngest (max created_at)
+        ih = argmax([(qr.tag[2], created_at(qr.slot)) for qr in high_queryresults])
         return (low_queryresults[il], high_queryresults[ih])
     end
 
@@ -97,7 +116,7 @@ EnhancedSwapperProt(net::RegisterNet, node::Int; kwargs...) = EnhancedSwapperPro
     rounds = prot.rounds
     round = 1
     while rounds != 0
-        qubit_pair_ = enhancedfindswapablequbits(prot.net, prot.node, prot.nodeL, prot.nodeH, prot.chooseL, prot.chooseH, prot.chooseslots; agelimit=prot.agelimit)
+        qubit_pair_ = enhancedfindswapablequbits(prot.net, prot.node, prot.nodeL, prot.nodeH, prot.chooseL, prot.chooseH, prot.chooseslots; agelimit=prot.agelimit, policy=prot.policy)
         if isnothing(qubit_pair_)
             if isnothing(prot.retry_lock_time)
                 @debug "EnhancedSwapperProt: no swappable qubits found. Waiting for tag change..."

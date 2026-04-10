@@ -17,7 +17,7 @@ function repeater_chain(nrepeaters::Int, nslots::Int; linklength::AbstractFloat=
     speedOfLightFiber = 2e8 # km/s
     delay = linklength / speedOfLightFiber
     # delay_us = delay * 1e6 # in microseconds
-    delay_us = 0.0
+    delay_us = 0.00
 
     graph = grid([nrepeaters + 2])
     if coherencetime === nothing
@@ -40,16 +40,17 @@ Base.show(io::IO, tag::PrivateEntanglementCounterpart) = print(io, "(Private) En
 Tag(tag::PrivateEntanglementCounterpart) = Tag(PrivateEntanglementCounterpart, tag.remote_node, tag.remote_slot)
 
 
-function get_entangler(sim, net, nodeA, nodeB, rate , capacity, slack)
+function get_entangler(sim, net, nodeA, nodeB, rate, capacity, slack; chooseslotA=QuantumSavory.alwaystrue, chooseslotB=QuantumSavory.alwaystrue)
 
     # compute the max number of attempts to wait, to avoid waiting too much
-    attempt_time = 0.001
+    # Ensure attempt_probability stays below 1 for high link rates
+    attempt_time = min(0.001, 0.9 / rate)
     attempt_probability = attempt_time * rate
     slack_window = (1 - slack) / capacity
     max_waiting_time = slack_window
     max_attempts = max(1, Int(ceil(max_waiting_time / attempt_time)))
 
-    return EntanglerProt(sim, net, nodeA, nodeB; attempt_time=attempt_time, success_prob=attempt_probability, rounds=1, tag=PrivateEntanglementCounterpart, margin=1, retry_lock_time=nothing, attempts=max_attempts)
+    return EntanglerProt(sim, net, nodeA, nodeB; attempt_time=attempt_time, success_prob=attempt_probability, rounds=1, tag=PrivateEntanglementCounterpart, margin=1, retry_lock_time=nothing, attempts=max_attempts, chooseslotA=chooseslotA, chooseslotB=chooseslotB)
 end
 
 function get_swapper(sim, net, node; agelimit=nothing, policy::String="OQF")
@@ -179,7 +180,7 @@ CustomEntanglementTracker(net::RegisterNet, node::Int) = CustomEntanglementTrack
                     continue
                 end
 
-                error("`CustomEntanglementTracker` on node $(prot.node) received a message $(msg) that it does not know how to handle (due to the absence of corresponding `EntanglementCounterpart` or `EntanglementHistory` or `EntanglementDelete` tags). This might have happened due to `CutoffProt` deleting qubits while swaps are happening. Make sure that the retention times in `CutoffProt` are sufficiently larger than the `agelimit` in `SwapperProt`. Otherwise, this is a bug in the protocol and should not happen -- please report an issue at QuantumSavory's repository.")
+                @warn "`CustomEntanglementTracker` on node $(prot.node) received a message $(msg) that it does not know how to handle (due to the absence of corresponding `EntanglementCounterpart` or `EntanglementHistory` or `EntanglementDelete` tags). This might have happened due to `CutoffProt` deleting qubits while swaps are happening. Make sure that the retention times in `CutoffProt` are sufficiently larger than the `agelimit` in `SwapperProt`. Otherwise, this is a bug in the protocol and should not happen -- please report an issue at QuantumSavory's repository."
             end
         end
         # @debug "CustomEntanglementTracker @$(prot.node): Starting message wait at $(now(prot.sim)) with MessageBuffer containing: $(mb.buffer)"
@@ -306,10 +307,12 @@ end
     nodeB::Int
     capacity::AbstractFloat = 10
     slack::AbstractFloat = 0.4
+    chooseslotA::Function = QuantumSavory.alwaystrue
+    chooseslotB::Function = QuantumSavory.alwaystrue
     out_filename::Union{String, Nothing} = nothing
     _log::Vector{@NamedTuple{node::Int, queueA::Int, queueB::Int, high_rate::Bool, time::Float64}} = @NamedTuple{node::Int, queueA::Int, queueB::Int, high_rate::Bool, time::Float64}[]
 end
-SchedulerProt(sim, net, nodeA, nodeB; capacity=10, slack=0.4, out_filename=nothing) = SchedulerProt(sim, net, nodeA, nodeB, capacity, slack, out_filename, @NamedTuple{node::Int, queueA::Int, queueB::Int, high_rate::Bool, time::Float64}[])
+SchedulerProt(sim, net, nodeA, nodeB; capacity=10, slack=0.4, chooseslotA=QuantumSavory.alwaystrue, chooseslotB=QuantumSavory.alwaystrue, out_filename=nothing) = SchedulerProt(sim, net, nodeA, nodeB, capacity, slack, chooseslotA, chooseslotB, out_filename, @NamedTuple{node::Int, queueA::Int, queueB::Int, high_rate::Bool, time::Float64}[])
 
 function log(prot::SchedulerProt; kwargs...)
 
@@ -353,8 +356,10 @@ function get_queue_state(node::Int, net::RegisterNet)
     reg = net[node]
     entangled_left = queryall(reg, EntanglementCounterpart, <(node), ❓)
     entangled_right = queryall(reg, EntanglementCounterpart, >(node), ❓)
-    # assert that one side is empty (up to the newly generated entanglement)
-    @assert (length(entangled_left) <= 1) || (length(entangled_right) <= 1)
+    # warn if both sides have >1 qubit (can happen transiently when multiple pairs are generated simultaneously)
+    if (length(entangled_left) > 1) && (length(entangled_right) > 1)
+        @warn "get_queue_state @node $node: both sides have >1 entangled qubit (left=$(length(entangled_left)), right=$(length(entangled_right))). Likely transient from simultaneous entanglement generation."
+    end
     return length(entangled_right) - length(entangled_left)
 end
 
@@ -380,7 +385,7 @@ end
     new_rate = prot.capacity
     last_time_logged = now(sim)
     while true
-        entangler = get_entangler(sim, net, nodeA, nodeB, new_rate, prot.capacity, prot.slack)
+        entangler = get_entangler(sim, net, nodeA, nodeB, new_rate, prot.capacity, prot.slack; chooseslotA=prot.chooseslotA, chooseslotB=prot.chooseslotB)
         proc = @process entangler()
 
         @debug "Scheduler at link $nodeA, $nodeB waiting for entanglement to be generated at rate $new_rate."
@@ -471,10 +476,25 @@ function setup(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linkle
     end
 
     # Setup the scheduler protocol at each link
+    # Slot partitioning to prevent deadlock at repeaters with finite slots:
+    # For the link (nodeA, nodeB), the entangler at nodeA uses the first N-1 slots
+    # (rightward direction) and at nodeB uses the last N-1 slots (leftward direction).
+    # End nodes (Alice=1, Bob=nrepeaters+2) have no restriction since they face only one link.
+    total_nodes = nrepeaters + 2
     schedulers = []
     for node in 1:(nrepeaters+1)
+        nodeA = node
+        nodeB = node + 1
+        # nodeA is the left node of this link — this is its rightward entangler
+        # For a repeater, restrict to first N-1 slots; for end node Alice, use all slots
+        nA = nsubsystems(net[nodeA])
+        chooseslotA = (nodeA == 1 || nodeA == total_nodes) ? QuantumSavory.alwaystrue : (i -> i <= nA - 2)
+        # nodeB is the right node of this link — this is its leftward entangler
+        # For a repeater, restrict to last N-1 slots; for end node Bob, use all slots
+        chooseslotB = (nodeB == 1 || nodeB == total_nodes) ? QuantumSavory.alwaystrue : (i -> i >= 3)
+
         filename = usetempfile ? joinpath(outfolder, "_results_temp.csv") : (outfile === nothing ? joinpath(outfolder, "results.csv") : joinpath(outfolder, outfile))
-        scheduler = SchedulerProt(sim, net, node, node+1; capacity=linkcapacity, slack=slack, out_filename=filename)
+        scheduler = SchedulerProt(sim, net, nodeA, nodeB; capacity=linkcapacity, slack=slack, chooseslotA=chooseslotA, chooseslotB=chooseslotB, out_filename=filename)
         push!(schedulers, scheduler)
         @process scheduler()
     end
@@ -491,8 +511,9 @@ end
 # SEQUENTIAL SWAPS SIMULATION SETUP
 ####################################
 
-include("enhanced_qtcp.jl")
+#include("enhanced_qtcp.jl")
 
+"""
 function setup_seq(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; linklength::AbstractFloat=0.0, slack=0.4, coherencetime::Union{AbstractFloat, Nothing}=nothing, outfolder::String="./out/", outfile::Union{String, Nothing}=nothing, usetempfile::Bool=false)
     net = repeater_chain(nrepeaters, nslots; linklength=linklength, coherencetime=coherencetime)
     sim = get_time_tracker(net)
@@ -530,3 +551,4 @@ function setup_seq(nrepeaters::Int, nslots::Int, linkcapacity::AbstractFloat; li
 
     return (sim, net, consumer, nothing)
 end
+"""

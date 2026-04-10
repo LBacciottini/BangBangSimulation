@@ -9,7 +9,8 @@ export setup, setup_seq, dump_log,
 import_data, analyze_data, analyze_consumer_data,
 # scenarios.jl
 Scenario, bk_link_capacity, mean_ci, safe_analyze_consumer_data, default_config,
-sliding_window_analysis, run_one_sliding, run_one
+sliding_window_analysis, run_one_sliding, run_one, run_one_steady,
+binary_entropy, bb84_skr, optimal_slack
 
 include("setup.jl")
 include("dataprocess.jl")

@@ -30,11 +30,11 @@ function analyze_data(df::Union{DataFrame, Nothing}, consumer_df::DataFrame)
     return results
 end
 
-function analyze_consumer_data(df::DataFrame)
+function analyze_consumer_data(df::DataFrame; steady_state_start::Float64=100.0)
     # df has columns: time, obs1, obs2
-    steady_state = filter(row -> row.time > 100.0, df)
+    steady_state = filter(row -> row.time > steady_state_start, df)
     fidelity = mean(steady_state.obs1)
     throughput = size(steady_state, 1) / (maximum(steady_state.time) - minimum(steady_state.time))
-    
+
     return fidelity, throughput
 end
