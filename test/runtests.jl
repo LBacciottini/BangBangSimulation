@@ -1,13 +1,45 @@
 using BangBangSimulation
 using QuantumSavory
-using QuantumSavory.ProtocolZoo: EntanglementCounterpart
+using Graphs: nv
+using Statistics: mean
 using Test
 using CSV
 using DataFrames
 using Logging
 using Random
+using ConcurrentSim: @process, Process
 
 const OUTFOLDER = mktempdir()
+
+function count_public_reciprocity_mismatches(net)
+    bad = 0
+    for node in 1:nv(net.graph)
+        reg = net[node]
+        for slot_idx in 1:nsubsystems(reg)
+            slot = reg[slot_idx]
+            info = query(slot, FlowEntanglementCounterpart, ❓, ❓, ❓; locked=nothing, assigned=nothing)
+            isnothing(info) && continue
+            remote_node = info.tag[3]
+            remote_slot_idx = info.tag[4]
+            remote_slot = net[remote_node][remote_slot_idx]
+            if !isassigned(remote_slot)
+                bad += 1
+                continue
+            end
+            remote_info = query(
+                remote_slot,
+                FlowEntanglementCounterpart,
+                info.tag[2],
+                node,
+                slot_idx;
+                locked=nothing,
+                assigned=nothing,
+            )
+            isnothing(remote_info) && (bad += 1)
+        end
+    end
+    return bad
+end
 
 @testset "BangBangSimulation.jl" begin
     # first test is just to see if the module loads
@@ -71,17 +103,17 @@ const OUTFOLDER = mktempdir()
             run(sim, 20)
             rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
             # After running with cutoff, verify that no slot holds an
-            # EntanglementCounterpart tag pointing to a remote slot that
+            # FlowEntanglementCounterpart tag pointing to a remote slot that
             # is unassigned (which would mean the delete message was lost).
             all_consistent = true
             for node in 1:3
                 reg = net[node]
                 for slot_idx in 1:nsubsystems(reg)
                     slot = reg[slot_idx]
-                    info = query(slot, EntanglementCounterpart, ❓, ❓)
+                    info = query(slot, FlowEntanglementCounterpart, ❓, ❓, ❓)
                     if !isnothing(info)
-                        remote_node = info.tag[2]
-                        remote_slot_idx = info.tag[3]
+                        remote_node = info.tag[3]
+                        remote_slot_idx = info.tag[4]
                         remote_slot = net[remote_node][remote_slot_idx]
                         if !isassigned(remote_slot)
                             all_consistent = false
@@ -90,6 +122,26 @@ const OUTFOLDER = mktempdir()
                 end
             end
             @test all_consistent
+        end
+    end
+
+    @testset "Flow-aware tracker updates" begin
+        @testset "Stale update for another flow is ignored" begin
+            net = BangBangSimulation.repeater_chain(1, 2)
+            sim = get_time_tracker(net)
+            tracker = BangBangSimulation.CustomEntanglementTracker(sim, net, 1)
+            @process tracker()
+
+            initialize!(net[1][1])
+            tag!(net[1][1], FlowEntanglementCounterpart, 2, 2, 1)
+
+            stale_msg = Tag(BangBangSimulation.FlowEntanglementUpdateX(1, 2, 1, 1, 3, 1, 0))
+            put!(messagebuffer(net, 1), stale_msg)
+            run(sim, 0.1)
+
+            info = query(net[1][1], FlowEntanglementCounterpart, ❓, ❓, ❓; locked=nothing, assigned=nothing)
+            @test !isnothing(info)
+            @test info.tag == Tag(FlowEntanglementCounterpart, 2, 2, 1)
         end
     end
 
@@ -152,7 +204,7 @@ const OUTFOLDER = mktempdir()
             @test cfg.coherencetime == 2.0
             @test cfg.scenarios[4].policy == "YQF"
             @test cfg.scenarios[4].cutofftime === nothing
-            @test length(cfg.scenarios) == 7
+            @test length(cfg.scenarios) == 8
         end
     end
 
@@ -234,6 +286,174 @@ const OUTFOLDER = mktempdir()
             run(sim, 30)
             rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
             @test length(consumer._log) > 0
+        end
+
+        @testset "Single-link slack=0 stays near physical rate" begin
+            Random.seed!(1)
+            bk = bk_link_capacity(linklength_km=20.0, excitation_time_s=17e-6, static_eff=0.28)
+            sim, net, consumer, schedulers = setup(0, 500, bk.rate;
+                linklength=20.0,
+                slack=0.0,
+                cutofftime=nothing,
+                coherencetime=2.0,
+                outfolder=OUTFOLDER,
+                usetempfile=true)
+            run(sim, 15.0)
+            rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+            avg_rate = length(consumer._log) / 15.0
+            @test avg_rate >= 0.90 * bk.rate
+        end
+
+        @testset "Deep single-flow chain stays reciprocal and high-throughput" begin
+            Random.seed!(1)
+            bk = bk_link_capacity(linklength_km=20.0, excitation_time_s=17e-6, static_eff=0.28)
+            sim, net, consumer, schedulers = setup(5, 500, bk.rate;
+                linklength=20.0,
+                slack=0.0,
+                cutofftime=nothing,
+                coherencetime=2.0,
+                outfolder=OUTFOLDER,
+                usetempfile=true)
+            run(sim, 10.0)
+            rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+
+            @test count_public_reciprocity_mismatches(net) == 0
+            @test length(consumer._log) / 10.0 >= 0.75 * bk.rate
+        end
+    end
+
+    @testset "Multi-flow BangBang" begin
+        function assert_valid_flow_tags(net, flows)
+            valid_flow_ids = Set(f.id for f in flows)
+            for node in 1:nv(net.graph)
+                reg = net[node]
+                for slot_idx in 1:nsubsystems(reg)
+                    info = query(reg[slot_idx], FlowEntanglementCounterpart, ❓, ❓, ❓)
+                    if !isnothing(info)
+                        @test info.tag[2] in valid_flow_ids
+                    end
+                end
+            end
+        end
+
+        @testset "Two disjoint flows" begin
+            Random.seed!(11)
+            flows = [Flow(1, 1, 3, "left"), Flow(2, 4, 6, "right")]
+            sim, net, consumers, controllers = setup_multiflow(4, 10, 4.0, flows;
+                linklength=10.0, coherencetime=10.0,
+                outfolder=OUTFOLDER, usetempfile=true)
+            run(sim, 30)
+            rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+            @test length(consumers) == 2
+            @test length(consumers[1]._log) > 0
+            @test length(consumers[2]._log) > 0
+            assert_valid_flow_tags(net, flows)
+        end
+
+        @testset "Two overlapping flows" begin
+            Random.seed!(12)
+            flows = [Flow(1, 1, 4, "f1"), Flow(2, 2, 5, "f2")]
+            sim, net, consumers, controllers = setup_multiflow(3, 20, 5.0, flows;
+                linklength=10.0, coherencetime=10.0,
+                outfolder=OUTFOLDER, usetempfile=true)
+            run(sim, 120)
+            rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+            @test all(c -> length(c._log) > 0, consumers)
+            assert_valid_flow_tags(net, flows)
+        end
+
+        @testset "Full overlap remains non-starving" begin
+            Random.seed!(13)
+            flows = [Flow(1, 1, 5, "f1"), Flow(2, 1, 5, "f2")]
+            sim, net, consumers, controllers = setup_multiflow(3, 24, 5.0, flows;
+                linklength=10.0, coherencetime=10.0,
+                outfolder=OUTFOLDER, usetempfile=true)
+            run(sim, 180)
+            rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+            counts = [length(c._log) for c in consumers]
+            @test all(>(0), counts)
+            @test maximum(counts) / minimum(counts) <= 10
+            assert_valid_flow_tags(net, flows)
+        end
+
+        @testset "Identical flows are fair on average" begin
+            flows = [Flow(1, 1, 5, "f1"), Flow(2, 1, 5, "f2")]
+            seeds = 1:12
+            counts_by_seed = Vector{NTuple{2,Int}}()
+
+            for seed in seeds
+                Random.seed!(seed)
+                sim, net, consumers, controllers = setup_multiflow(3, 24, 5.0, flows;
+                    linklength=10.0, coherencetime=10.0,
+                    outfolder=OUTFOLDER, usetempfile=true)
+                run(sim, 100)
+                rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+                counts = (length(consumers[1]._log), length(consumers[2]._log))
+                push!(counts_by_seed, counts)
+                @test counts[1] > 0
+                @test counts[2] > 0
+            end
+
+            avg1 = mean(first.(counts_by_seed))
+            avg2 = mean(last.(counts_by_seed))
+            rel_gap = abs(avg1 - avg2) / max(avg1, avg2)
+
+            @test rel_gap <= 0.20
+        end
+
+    end
+
+    @testset "Multi-flow Baselines" begin
+        @testset "Equal partition reservations are disjoint and aligned" begin
+            flows = [Flow(1, 1, 5, "f1"), Flow(2, 1, 5, "f2"), Flow(3, 2, 4, "mid")]
+            net = BangBangSimulation.repeater_chain(3, 12; linklength=10.0, coherencetime=10.0)
+            reservations = BangBangSimulation.build_link_reservations(net, flows; slot_allocation=:equal_partitioned)
+
+            for ((nodeA, nodeB), link_map) in reservations
+                defaultA, defaultB = BangBangSimulation.partitioned_link_slot_indices(net, nodeA, nodeB)
+                usedA = Int[]
+                usedB = Int[]
+
+                for reservation in values(link_map)
+                    append!(usedA, reservation.slotsA)
+                    append!(usedB, reservation.slotsB)
+                end
+
+                @test length(unique(usedA)) == length(usedA)
+                @test length(unique(usedB)) == length(usedB)
+                @test sort(usedA) == sort(defaultA)
+                @test sort(usedB) == sort(defaultB)
+            end
+        end
+
+        @testset "Reserved-pool baseline is fair on average" begin
+            flows = [Flow(1, 1, 5, "f1"), Flow(2, 1, 5, "f2")]
+            seeds = 1:8
+            counts_by_seed = Vector{NTuple{2,Int}}()
+
+            for seed in seeds
+                Random.seed!(seed)
+                sim, net, consumers, controllers = setup_multiflow(3, 24, 5.0, flows;
+                    link_controller=:reserved_pool,
+                    slot_allocation=:equal_partitioned,
+                    linklength=10.0,
+                    coherencetime=10.0,
+                    cutofftime=2.0,
+                    outfolder=OUTFOLDER,
+                    usetempfile=true)
+                run(sim, 120)
+                rm(joinpath(OUTFOLDER, "_results_temp.csv"), force=true)
+                counts = (length(consumers[1]._log), length(consumers[2]._log))
+                push!(counts_by_seed, counts)
+                @test counts[1] > 0
+                @test counts[2] > 0
+            end
+
+            avg1 = mean(first.(counts_by_seed))
+            avg2 = mean(last.(counts_by_seed))
+            rel_gap = abs(avg1 - avg2) / max(avg1, avg2)
+
+            @test rel_gap <= 0.25
         end
     end
 
